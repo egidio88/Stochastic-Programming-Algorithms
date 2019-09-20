@@ -1,0 +1,17 @@
+function slamming(nodes,xmean,xs,optSense,iter, probS, variant)
+    println("+++++++++++++++++++++++++++++")
+    println(" Starting Variable Slamming")
+    println("+++++++++++++++++++++++++++++")
+
+    Zk = 0
+    null_λ = zeros(length(xmean), length(nodes))
+    null_ρ = 0
+    null_ρ_vect = zeros(length(xmean), length(nodes))
+    slamming_flag = 1
+    for node in nodes
+       (s_idx,xs,Zkn) = solvenodePH(node,null_λ,null_ρ,null_ρ_vect,xmean,xs, optSense,iter+1, iter+2, 100*ones(size(xmean)), 1, slamming_flag, variant)
+       Zk += Zkn*probS[s_idx]
+    end
+
+    return (xs, Zk)
+end

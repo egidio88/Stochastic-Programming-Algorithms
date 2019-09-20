@@ -1,0 +1,47 @@
+using CPLEX, JuMP
+using Plasmo
+using Logging
+using Requires
+
+
+Logging.configure(level=DEBUG)
+
+## Progressive Hedging file decomposition files
+include("./PHsolve")
+include("./Solution")
+include("./utils")
+
+
+# create PLASMO model
+graph = ModelGraph()
+Plasmo.setsolver(graph, CPLEX.CplexSolver())
+
+d = [5, 2]          # uncertain parameter
+
+NS = 2              # number of scenarios
+child_nodes = Array{Plasmo.PlasmoModels.ModelNode}(NS)
+probS = [0.6 0.4]   # probability of each scenario
+for s in 1:NS
+
+    bl = Model()
+    @variable(bl, x >= 0)
+
+    @constraint(bl, x  <= 6) #1 constraint
+    @constraint(bl, x  >= 3) #1 constraint
+
+    @objective(bl, Min, (x-d[s])^2)
+
+    child_node = add_node(graph,bl)
+    child_nodes[s] = child_node
+    if s!=1
+        node1 = child_nodes[1]
+        @linkconstraint(graph, node1[:x] == x ) # Non-anticipativity constraints
+    end
+end
+
+# Solve with progressive hedging
+status = PHsolve(graph; probS = [0.6 0.4])
+println("Opt solution first stage variable:")
+println(getvalue(child_nodes[1][:x]))
+
+# x* = 3.80 z* = 2.16

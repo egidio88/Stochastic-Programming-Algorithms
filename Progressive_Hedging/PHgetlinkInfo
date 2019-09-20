@@ -1,0 +1,28 @@
+function PHgetlinkInfo(nodedict, links)
+
+    # Define the number of variables involved in the complicating constraints
+    nmult = 0
+    for n in nodedict
+        mn = getmodel(n)
+        mn.ext[:varflag] = Dict()
+        mn.ext[:linkvar] = 0
+        mn.ext[:varcounter] = Dict()
+    end
+
+    # Crate an index for each variable
+    for (i,lc) in enumerate(links)
+      for j in 1:length(lc.terms.vars)
+          var = lc.terms.vars[j]
+          if haskey(var.m.ext[:varflag], var) == false
+              var.m.ext[:varflag][var] = 1
+              var.m.ext[:linkvar] += 1
+              var.m.ext[:varcounter][var] = var.m.ext[:linkvar]       #Assign Index to each variable
+          end
+      end
+    end
+
+    ex_m = getmodel(first(nodedict))
+    nmult = ex_m.ext[:linkvar]
+
+    return nmult
+end

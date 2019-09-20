@@ -1,0 +1,442 @@
+"""
+  PHsolve(graph)
+  solve graph using progressive edging algorithm
+"""
+function PHsolve(graph;
+  ρ = 1.0,                          # coefficient of the quadratic penalty term
+  probS = ones(length(getnodes(graph)))/length(getnodes(graph)),   # probability of scenarios
+  max_iterations=100,               # maximum number of iterations
+  update_method=:subgradient,       # update method of multipliers
+  ϵ=0.0001,                         # ϵ-convergence tolerance
+  ϵ_norm = 0.000000000001,          # aveage convergence per scenario
+  timelimit=3600,                   # Time Limit
+  initialmultipliers =:zero,        # initialization of multipliers
+  conv_threshold = max_iterations +1, # fix variable after remains constant for "conv_threshold" iterations
+  do_slamming = 0,                  # Force variable equal to the mean after algorithm termination
+  ρ_vect = ones(length(getlinkconstraints(graph)),length(getnodes(graph))), # data structure to different ρ for each varable
+  δ =1,                             # NOT used - to reduce ρ according to the residual
+  maxnoimprove = 100,               # NOT used - to reduce ρ according to the residual
+  cpbound = 0.1                     # NOT used - to reduce ρ according to the residual
+)
+println("*****************************************")
+println("Starting Progressive Hedging algorithm")
+println("*****************************************")
+
+  ### INITIALIZATION ###
+  PHprepare(graph, probS, ρ, δ, maxnoimprove,cpbound)
+  n = getattribute(graph,:normalized)
+
+  if initialmultipliers == :relaxation
+    initialrelaxation(graph)
+  end
+
+  starttime = time()
+  s = Solution(method=:progressive_edging)
+
+  λ = getattribute(graph,:λ)[end]
+  xs = getattribute(graph,:xs)[end]
+  res = getattribute(graph,:Γ)[end]
+  xmean = getattribute(graph,:xmean)[end]
+  Γ_var = getattribute(graph,:Γ_var)[end]
+  nmult = getattribute(graph,:numlinks)
+
+
+  nodes = [node for node in getnodes(graph.basegraph)]
+  Nnodes = length(nodes)                         # Number of scenarios
+  optSense = :Min
+  ρ0 = ρ                                         # scalar penalty parameter
+  ρ0_vect = ρ_vect                               # matrix penalty parameter
+
+
+  ### ITERATIONS ###
+  for iter in 1:max_iterations
+    variant = iter == 1 ? :default : update_method # Use default version in the first iteration
+
+    # First iteration : solve the scenarios without penalties
+    if iter == 1
+        ρ = 0
+        ρ_vect = zeros(nmult,Nnodes)
+    else
+        ρ = ρ0
+        ρ_vect = ρ0_vect
+    end
+
+    iterstart = time()
+
+    # Solve subproblems
+    Zk = 0
+
+    var_conv = getattribute(graph,:var_conv)[1] # Number of iteration each variable has been the same
+    for node in nodes
+        if node == first(nodes)
+            optSense = getmodel(node).objSense
+        end
+       (s_idx, xs, Zkn) = solvenodePH(node,λ,ρ,ρ_vect,xmean, xs, optSense,iter,max_iterations, var_conv, conv_threshold, variant)
+       Zk += getattribute(node,:probability)*Zkn
+
+       println("++++++++++++++++++++++++++++++")
+       println("Scenario ", s_idx, " is solved")
+    end
+
+    # Zk *= n
+    setattribute(graph,:steptaken, true)
+
+    # --------------------------------------------------------------------------
+    # NOT USED
+    # Modify the quadratic penalty term accroding to the residual
+    # If too many iterations without improvement, decrease :ρ
+    #=
+    if graph.basegraph.attributes[:noimprove] >= graph.basegraph.attributes[:maxnoimprove]
+      graph.basegraph.attributes[:noimprove] = 0
+      graph.basegraph.attributes[:ρ][end] *= graph.basegraph.attributes[:δ]
+    end=#
+    # --------------------------------------------------------------------------
+
+    # Save info
+    setattribute(graph,:Zk,push!(getattribute(graph,:Zk),Zk))
+    #setattribute(graph,:xs,push!(getattribute(graph,:xs),xs))
+    push!(getattribute(graph,:xs),xs)
+    ρ = getattribute(graph,:ρ)[end]
+    setattribute(graph,:ρ,push!(getattribute(graph,:ρ),ρ))
+
+    # Compute xmean
+    xmean = zeros(nmult)
+    for i in 1:Int(nmult)
+        xmean[i] = sum(getattribute(node,:probability)*getattribute(node,:x_local)[i,getattribute(node,:s_idx)] for node in nodes)
+    end
+
+
+    # Compute converge factors Γ
+    if iter > 1
+        Γ=0
+        norm_res = 0    # normalized average per-scenario deviations from the average
+        for i in 1:Int(nmult)
+            for ω in nodes
+                Γ+= getattribute(ω,:probability)*norm(getattribute(ω,:x_local)[i,getattribute(ω,:s_idx)] - xmean[i])
+                if xmean[i] > 0
+                    norm_res+= norm(getattribute(ω,:x_local)[i,getattribute(ω,:s_idx)] - xmean[i])/xmean[i]*1/Nnodes
+                end
+                Γ_var[i] += getattribute(ω,:probability)*norm(getattribute(ω,:x_local)[i,getattribute(ω,:s_idx)] - xmean[i])
+            end
+            if Γ_var[i] <= ϵ
+                graph.basegraph.attributes[:var_conv][1][i] += 1
+            else
+                graph.basegraph.attributes[:var_conv][1][i] = 0
+            end
+        end
+
+        # --------------------------------------------------------------------------
+        # NOT USED
+        #=
+        if Γ > graph.basegraph.attributes[:Γ][end]
+          graph.basegraph.attributes[:noimprove] += 1
+        else
+          graph.basegraph.attributes[:noimprove] = 0
+        end=#
+        # --------------------------------------------------------------------------
+
+        push!(getattribute(graph,:xmean),xmean)
+        push!(getattribute(graph,:Γ),Γ)
+        push!(getattribute(graph,:Γ_var),Γ_var)
+        push!(getattribute(graph,:normres),norm_res)
+
+
+        itertime = time() - iterstart
+        tstamp = time() - starttime
+        saveiteration(s,tstamp,[norm_res,n*Zk,itertime,tstamp], Γ, n)
+        printiterationsummary(s,singleline=false)
+
+        # Check convergence
+        if Γ < ϵ
+          s.termination = "Optimal"
+          (xs, Zk) = slamming(nodes,xmean,xs,optSense,iter, variant)
+          push!(getattribute(graph,:Zk),Zk)
+          push!(getattribute(graph,:xs),xs)
+          println("------------------------------")
+          println("CONVERGENCE REACHED")
+          println("------------------------------")
+          println("objective function value: ", Zk)
+          return s
+        end
+
+        # Check average convergence
+        if norm_res < ϵ_norm
+          s.termination = "Optimal average convergence"
+          # Variables slamming
+          if do_slamming == 1
+              (xs, Zk) = slamming(nodes,xmean,xs,optSense,iter, variant)
+              push!(getattribute(graph,:Zk),Zk)
+              push!(getattribute(graph,:xs),xs)
+              println("------------------------------")
+              println("RESULTS AFTER VARIABLES SLAMMING")
+              println("------------------------------")
+              println("objective function value: ", Zk)
+          end
+          return s
+        end
+
+        # Check time limit
+        if tstamp > timelimit
+          s.termination = "Time Limit"
+          # Variables slamming
+          if do_slamming == 1
+              (xs, Zk) = slamming(nodes,xmean,xs,optSense,iter, variant)
+              push!(getattribute(graph,:Zk),Zk)
+              push!(getattribute(graph,:xs),xs)
+              println("------------------------------")
+              println("RESULTS AFTER VARIABLES SLAMMING")
+              println("------------------------------")
+              println("objective function value: ", Zk)
+          end
+          return s
+        end
+
+        # Update multipliers
+        λ = updatemultipliers(graph,λ,xs,xmean, ρ, ρ_vect, update_method)
+        setattribute(graph,:λ,push!(getattribute(graph,:λ),λ))
+
+        # Update iteration time
+        s.itertime[end] = time() - iterstart
+    end
+
+
+  end
+  s.termination = "Max Iterations"
+  # Variables slamming
+  if do_slamming == 1
+      (xs, Zk) = slamming(nodes,xmean,xs,optSense,max_iterations, :default)
+      push!(getattribute(graph,:Zk),Zk)
+      push!(getattribute(graph,:xs),xs)
+      println("------------------------------")
+      println("RESULTS AFTER VARIABLES SLAMMING")
+      println("------------------------------")
+      println("objective function value: ", Zk)
+  end
+  return s
+end
+
+# Preprocess function
+"""
+  PHprepare(graph::ModelGraph)
+  Prepares the graph to apply lagrange decomposition algorithm
+"""
+function PHprepare(graph::ModelGraph, probS, ρ, δ, maxnoimprove,cpbound=nothing)
+    if haskey(graph.basegraph.attributes,:preprocessed)
+        return true
+    end
+
+    n = normalizegraph(graph)
+    links = getlinkconstraints(graph)
+    nodedict = getnodes(graph.basegraph)
+    Nnodes = length(getnodes(graph))
+    nmult = PHgetlinkInfo(nodedict, links)
+    setattribute(graph,:numlinks, nmult)
+    setattribute(graph,:λ, Array[zeros(nmult,Nnodes)])      # Array{Float64}(nmult)
+    setattribute(graph,:xs, Array[zeros(nmult,Nnodes)])     # Linking variables values
+    setattribute(graph,:Γ_var, Array[zeros(nmult)])         # Residual per variable
+    setattribute(graph,:xmean, Array[zeros(nmult)])         # Array{Float64}(nmult)
+    setattribute(graph,:normres, [Inf])                     # Residuals
+    setattribute(graph,:Zk, [0.0])                          # Bounds
+    setattribute(graph,:Γ, [Inf])                           # Residuals
+    setattribute(graph,:ρ, [ρ])                             # Bounds
+    #graph.basegraph.attributes[:mflat] = #create_flat_graph_model(graph)
+    #graph.basegraph.attributes[:mflat].solver = graph.solver
+    setattribute(graph,:cuts, [])
+    setattribute(graph,:δ, δ)
+    setattribute(graph,:noimprove, 0)
+    setattribute(graph,:var_conv, [zeros(nmult)])
+    setattribute(graph,:maxnoimprove, maxnoimprove)
+    setattribute(graph,:explore, [])
+    setattribute(graph,:steptaken, false)
+
+    # Create Matrix to store SP information
+    for n in nodedict
+        indices = getindices(n)
+        keys_i = keys(indices)
+        s_idx = [indices[i] for i in keys_i][1]
+        setattribute(n,:probability,probS[s_idx])           # setting probability as node attribute
+        mn = getmodel(n)
+        if mn.solver == JuMP.UnsetSolver()
+            mn.solver = graph.linkmodel.solver
+        end
+        mn.ext[:preobj] = mn.obj
+        mn.ext[:multmap] = Dict()
+        mn.ext[:varmap] = Dict()
+        mn.ext[:Egivarmap] = Dict() # Same concept more general linking constraints
+        mn.ext[:idx] = s_idx
+        #mn.ext[:ϕ] = probS[s_idx]
+        mn.ext[:ϕ] = getattribute(n,:probability)
+
+
+    end
+
+  # Maps
+  # Multiplier map to know which component of λ to take
+  # Varmap knows what values to post where
+  for (i,lc) in enumerate(links)
+    for j in 1:length(lc.terms.vars)
+        var = lc.terms.vars[j]
+        if var.m.ext[:varflag][var] == 1    # to consider the variable only once
+            var.m.ext[:varflag][var] = 0
+            #var.m.ext[:varcounter] += 1
+            #var.m.ext[:multmap][i] = (lc.terms.coeffs[j],lc.terms.vars[j])
+            var.m.ext[:multmap][var] = (lc.terms.coeffs[j],lc.terms.vars[j])
+            var.m.ext[:varmap][var] = (i,j)
+            idx = var.m.ext[:idx]
+            if haskey(var.m.ext[:Egivarmap], var)
+                #var.m.ext[:Egivarmap][var] = [var.m.ext[:Egivarmap][var] ;(i,idx)]
+                var.m.ext[:Egivarmap][var] = [var.m.ext[:Egivarmap][var] ;(var.m.ext[:varcounter][var],idx)]
+            else
+                #var.m.ext[:Egivarmap][var] = (i,idx)
+                var.m.ext[:Egivarmap][var] = (var.m.ext[:varcounter][var],idx)
+            end
+        end
+    end
+  end
+
+  setattribute(graph,:preprocessed, true)
+end
+
+# Solve a single subproblem
+function solvenodePH(node, λ, ρ, ρ_vect, mean_x, xs_ϕ, optSense, iter, max_iterations, var_conv, conv_threshold, variant=:default)
+  m = getmodel(node)
+  countFixing = 0
+
+  s_idx = m.ext[:idx]  # the node are not always saved in the same order or the probability vector
+  setattribute(node, :s_idx, s_idx)
+  m.obj = m.ext[:preobj]
+  m.ext[:lgobj] = m.ext[:preobj]
+  # Add dualized part to objective function
+  for k in keys(m.ext[:multmap])
+    coef = m.ext[:multmap][k][1]
+    var = m.ext[:multmap][k][2]
+    row = m.ext[:Egivarmap][k][1]
+    m.ext[:lgobj] += λ[row,s_idx]*var + ρ/2*ρ_vect[row,s_idx]*(var-mean_x[row])^2
+    m.obj += λ[row,s_idx]*var + ρ/2*ρ_vect[row,s_idx]*(var-mean_x[row])^2
+
+    @objective(m, optSense, m.obj)
+
+    if var_conv[row] >= conv_threshold
+        @constraint(m, var == mean_x[row])
+        countFixing += 1
+    end
+  end
+  println(countFixing, " variables have reached convergence for scenario ", s_idx," at iteration ", iter)
+  mstatus = solve(m)
+  if mstatus != :Infeasible
+      for v in keys(m.ext[:Egivarmap])
+        val = getvalue(v)
+        tmp =  m.ext[:Egivarmap][v]
+
+        if typeof(tmp) == DataType(Tuple{Int64,Int64})
+            xs_ϕ[tmp...] = val
+        else
+            for itup in 1:size(tmp,1)
+                xs_ϕ[tmp[itup]...] = val
+            end
+        end
+
+      end
+  end
+
+
+
+  objval = getvalue(m.ext[:lgobj])
+  setattribute(node, :objective, objval)
+  setattribute(node, :solvetime, getsolvetime(m))
+  setattribute(node, :x_local, xs_ϕ)
+  return s_idx, xs_ϕ, objval
+end
+
+# Multiplier Initialization
+function initialrelaxation(graph)
+  if !haskey(graph.basegraph.attributes,:mflat)
+    graph.basegraph.attributes[:mflat] = create_flat_graph_model(graph)
+    graph.basegraph.attributes[:mflat].solver = graph.linkmodel.solver
+  end
+  n = graph.basegraph.attributes[:normalized]
+  nmult = graph.basegraph.attributes[:numlinks]
+  mf = graph.basegraph.attributes[:mflat]
+  mf.solver = graph.linkmodel.solver
+  solve(mf,relaxation=true)
+  graph.basegraph.attributes[:λ][end] = n*mf.linconstrDuals[end-nmult+1:end]
+  return getobjectivevalue(mf)
+end
+
+function updatemultipliers(graph,λ,xs,xmean, ρ, ρ_vect, method)
+  if method == :subgradient
+      subgradient(graph,λ,xs,xmean,ρ,ρ_vect)
+  else
+      error("No method to update multipliers found")
+  end
+end
+
+# Update functions
+function subgradient(graph,λ,xs,xmean,ρ, ρ_vect)
+  for i in 1:size(xs,2)
+      λ[:,i] += ρ*ρ_vect[:,i].*(xs[:,i]-xmean)
+  end
+   return λ
+end
+
+# Parallel model solve function, returns an array of objective values with dimension equal to of elements in the collection for which pmap was applied
+function psolve(m::JuMP.Model)
+  solve(m)
+  d = Dict()
+  d[:objective] = getobjectivevalue(m)
+  d[:values] = m.colVal
+  node = getnode(m)
+  for v in values(node.index)
+    d[:nodeindex] = v
+  end
+  #println("Solved node $(d[:nodeindex]) on $(gethostname())")
+  return d
+end
+
+
+function PHgetlinkInfo(nodedict, links)
+
+    # Define the number of variables involved in the complicating constraints
+    nmult = 0
+    for n in nodedict
+        mn = getmodel(n)
+        mn.ext[:varflag] = Dict()
+        mn.ext[:linkvar] = 0
+        mn.ext[:varcounter] = Dict()
+    end
+
+    # Crate an index for each variable
+    for (i,lc) in enumerate(links)
+      for j in 1:length(lc.terms.vars)
+          var = lc.terms.vars[j]
+          if haskey(var.m.ext[:varflag], var) == false
+              var.m.ext[:varflag][var] = 1
+              var.m.ext[:linkvar] += 1
+              var.m.ext[:varcounter][var] = var.m.ext[:linkvar]       #Assign Index to each variable
+          end
+      end
+    end
+
+    ex_m = getmodel(first(nodedict))
+    nmult = ex_m.ext[:linkvar]
+
+    return nmult
+end
+
+function slamming(nodes,xmean,xs,optSense,iter, variant)
+    println("+++++++++++++++++++++++++++++")
+    println(" Starting Variable Slamming")
+    println("+++++++++++++++++++++++++++++")
+
+    Zk = 0
+    null_λ = zeros(length(xmean), length(nodes))
+    null_ρ = 0
+    null_ρ_vect = zeros(length(xmean), length(nodes))
+
+    for node in nodes
+       (s_idx,xs,Zkn) = solvenodePH(node,null_λ,null_ρ,null_ρ_vect,xmean,xs, optSense,iter, iter+1, 100*ones(size(xmean)), 1, variant)
+       Zk += getattribute(node,:probability)*Zkn
+    end
+
+    return (xs, Zk)
+end

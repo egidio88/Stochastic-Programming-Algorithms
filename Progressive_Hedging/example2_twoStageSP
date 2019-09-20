@@ -1,0 +1,54 @@
+using CPLEX, JuMP
+using Plasmo
+using Logging
+using Requires
+
+
+Logging.configure(level=DEBUG)
+
+## Progressive Hedging file decomposition files
+include("D:/Julia_Algorithms/Progressive_Hedging/PHsolve")
+include("D:/Julia_Algorithms/Progressive_Hedging/Solution")
+include("D:/Julia_Algorithms/Progressive_Hedging/utils")
+include("D:/Julia_Algorithms/Progressive_Hedging/PHgetlinkInfo")
+include("D:/Julia_Algorithms/Progressive_Hedging/slamming")
+
+
+#include("C:/Julia_Algorithms/Lagrange Decomposition/lagrangesolve")
+#include("C:/Julia_Algorithms/Lagrange Decomposition/Solution")
+#include("C:/Julia_Algorithms/Lagrange Decomposition/utils")
+
+# create PLASMO model and solve with PIPS-NLP
+graph = ModelGraph()
+Plasmo.setsolver(graph, CPLEX.CplexSolver())
+
+# First stage model
+d = [5, 2]
+
+NS = 2
+child_nodes = Array{Plasmo.PlasmoModels.ModelNode}(NS)
+probS = [0.6 0.4]
+for s in 1:NS
+
+    bl = Model()
+    @variable(bl, x >= 0)
+
+    @constraint(bl, x  <= 6) #1 constraint
+    @constraint(bl, x  >= 3) #1 constraint
+
+    @objective(bl, Min, probS[s]*(x-d[s])^2)
+
+    child_node = add_node(graph,bl)
+    child_nodes[s] = child_node
+    if s!=1
+        node1 = child_nodes[1]
+        @linkconstraint(graph, node1[:x] == x )
+    end
+end
+ρ = 1
+ρ_vect = ones(1,NS)
+
+
+#status = solve(graph)
+status = PHsolve(graph, probS, ρ, ρ_vect; ϵ_norm = 0.00000000001, max_iterations = 100, timelimit=7200, conv_threshold = 100)
+#getobjectivevalue(graph)
